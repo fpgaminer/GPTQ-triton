@@ -19,7 +19,13 @@ def main():
 	args = parser.parse_args()
 
 	# Load quantized data
-	state_dict = torch.load(args.quant, map_location='cpu')
+	use_safe_tensors = False
+	if args.quant.endswith('.safetensors'):
+		use_safe_tensors = True
+		from safetensors.torch import load_file as safe_load
+		state_dict = (safe_load(args.quant))
+	else:
+		state_dict = torch.load(args.quant, map_location='cpu')
 
 	# Build a reference model
 	config = LlamaConfig.from_pretrained(args.model)
@@ -57,7 +63,11 @@ def main():
 	output_path.mkdir(parents=True, exist_ok=True)
 
 	# Save the model
-	torch.save(state_dict, output_path / 'model.pt')
+	if use_safe_tensors:
+		from safetensors.torch import save_file as safe_save
+		safe_save(state_dict, output_path / 'model.safetensors')
+	else:
+		torch.save(state_dict, output_path / 'model.pt')
 
 	# Write quant_config.json
 	with open(output_path / 'quant_config.json', 'w') as f:
