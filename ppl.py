@@ -14,6 +14,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--model', type=str, help='Path to model, either a HuggingFace model or a quantized model')
 parser.add_argument('--quant', action='store_true', help='Whether the model is quantized')
 parser.add_argument('--stride', type=int, default=512, help='Stride for calculating perplexity')
+parser.add_argument('--context-length', type=int, default=2048, help='Length of context to use')
 
 
 def main():
@@ -29,9 +30,10 @@ def main():
 		model.to('cuda')
 	
 	tokenizer = AutoTokenizer.from_pretrained(args.model)
+	context_length = model.seqlen if args.context_length is None else args.context_length
 
 	for dataset in ['wikitext-2', 'ptb', 'c4']:
-		ppl = calculate_perplexity(model, tokenizer, dataset, max_length=model.seqlen, stride=args.stride)
+		ppl = calculate_perplexity(model, tokenizer, dataset, max_length=context_length, stride=args.stride)
 		print(f"{dataset} perplexity: {ppl}")
 
 

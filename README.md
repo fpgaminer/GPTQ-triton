@@ -40,6 +40,14 @@ For the 4bit CUDA results, a custom version of `ppl.py` was used, as the current
 | GPTQ Triton                                        |   4  |     -1     |     8611    | 1.52 |    5.44   |  8.24 | 7.48 |
 
 
+| [LLaMA-13B](https://arxiv.org/abs/2302.13971)      | Bits | group-size | memory(MiB) | it/s | Wikitext2 |  PTB  |  C4  |
+| -------------------------------------------------- | ---- | ---------- | ----------- | ---- | --------- | ----- | ---- |
+| FP16                                               |  16  |      -     |    OOM      |   -  |       -   |    -  |   -  |
+| GPTQ Triton                                        |   4  |     -1     |    13241    | 0.89 |    4.74   |  7.49 | 7.00 |
+
+
+
+
 ## Usage
 
 ### Converting a model
@@ -66,6 +74,16 @@ This will calculate PPL for a quantized model.
 This is useful for verifying correctness of the Triton kernel, comparing it to the CUDA kernel, and comparing it to the original FP16 model.
 
 
-### Elsewhere
+### Generation
 
-See the `ppl.py` code for how to load and use the model in your own code.
+An example script, `generate.py`, is provided for generating text from a model.  This is an example only, and should be modified to suit your needs.
+
+`./generate.py --model <Path to your quantized model> --quant --prompt "Write a story about a duck: Once upon a time there was a duck" --temperature 0.6 --top-p 0.6 --repetition-penalty 1.1`
+
+WARNING: The first time you run this script it might take a long time while it compiles and optimizes the Triton kernel for all the different input sizes.  This is normal, and subsequent runs should be much faster.  It's almost important to note that like all LLM generation tasks, token generation speed is a function of context length, and thus the above example will generate the first tokens quickly but then slow down as the context length increases.  On my 3090 with a 7B parameter model:
+
+```
+Generation took 82.30 seconds
+Total tokens generated: 915
+Average generation speed: 11.12 tokens per second
+```

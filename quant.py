@@ -84,7 +84,7 @@ def make_quant(model, bits, groupsize):
 		parent_name = name.rsplit('.', 1)[0]
 		parent = model.get_submodule(parent_name)
 
-		print(f"Replacing {name} with quant; parent: {parent_name}, child's name: {name[len(parent_name) + 1:]}")
+		#print(f"Replacing {name} with quant; parent: {parent_name}, child's name: {name[len(parent_name) + 1:]}")
 
 		setattr(parent, name[len(parent_name) + 1:], qlayer)
 
@@ -160,6 +160,7 @@ def matmul4_kernel(
 	zeros is of shape (1, N) float16
 
 	WARNING: This kernel assumes that K is a multiple of BLOCK_SIZE_K.
+	WARNING: This kernel assumes that N is a multiple of BLOCK_SIZE_N.
 	"""
 	pid = tl.program_id(axis=0)
 	num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -176,6 +177,7 @@ def matmul4_kernel(
 	offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 	offs_k = tl.arange(0, BLOCK_SIZE_K)
 	a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)   # (BLOCK_SIZE_M, BLOCK_SIZE_K)
+	a_mask = (offs_am[:, None] < M)
 	# b_ptrs is set up such that it repeats elements along the K axis 8 times
 	b_ptrs = b_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 	scales_ptrs = scales_ptr + offs_bn * stride_scales
@@ -200,7 +202,7 @@ def matmul4_kernel(
 	# It's calculating BLOCK_SIZE_M batches in parallel, and for each batch, BLOCK_SIZE_N outfeatures in parallel
 	accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 	for k in range(0, num_pid_k):
-		a = tl.load(a_ptrs)
+		a = tl.load(a_ptrs, mask=a_mask, other=0.)   # (BLOCK_SIZE_M, BLOCK_SIZE_K)
 		b = tl.load(b_ptrs)   # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
 
 		# Now we need to unpack b (which is 4-bit values) into 32-bit values
@@ -244,7 +246,10 @@ def triton_matmul4(a: torch.FloatTensor, qweight: torch.IntTensor, scales: torch
 
 	M, K = x.shape
 	N = qweight.shape[1]
+	# This is based on the maximum BLOCK_SIZE_K; for our use cases (LLMs) we expect K to be large and a power of two
 	assert K % 32 == 0
+	# This is based on the maximum BLOCK_SIZE_N; for our use cases (LLMs) we expect N to be large and a power of two
+	assert N % 256 == 0, "N must be a multiple of 256"
 
 	# Unpack zeros into (1, N) float16
 	zeros = qzeros.flatten()  # (N//8,) int32
