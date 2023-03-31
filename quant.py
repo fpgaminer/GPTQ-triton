@@ -157,7 +157,7 @@ def matmul4_kernel(
 	B is of shape (K//8, N) int32
 	C is of shape (M, N) float16
 	scales is of shape (1, N) float16
-	zeros is of shape (1, N) float16
+	zeros is of shape (1, N//8) int32
 
 	WARNING: This kernel assumes that K is a multiple of BLOCK_SIZE_K.
 	WARNING: This kernel assumes that N is a multiple of BLOCK_SIZE_N.
@@ -181,14 +181,20 @@ def matmul4_kernel(
 	# b_ptrs is set up such that it repeats elements along the K axis 8 times
 	b_ptrs = b_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 	scales_ptrs = scales_ptr + offs_bn * stride_scales
-	zeros_ptrs = zeros_ptr + offs_bn * stride_zeros
+	# zeros_ptrs is set up such that it repeats elements along the N axis 8 times
+	zeros_ptrs = zeros_ptr + (offs_bn // 8) * stride_zeros
+
+	# shifter is used to extract the 4 bits of each element in the 32-bit word from B and zeros
+	shifter = (offs_k % 8) * 4
+	zeros_shifter = (offs_bn % 8) * 4
 
 	# Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
 	scales = tl.load(scales_ptrs)  # (BLOCK_SIZE_N,)
-	zeros = tl.load(zeros_ptrs)  # (BLOCK_SIZE_N,)
+	zeros = tl.load(zeros_ptrs)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
 
-	# shifter is used to extract the 4 bits of each element in the 32-bit word from B
-	shifter = (offs_k % 8) * 4
+	# Unpack zeros
+	zeros = (zeros >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
+	zeros = (zeros + 1) * scales  # (BLOCK_SIZE_N,) float16
 
 	# For debugging
 	#offs_dk = 0 + tl.arange(0, BLOCK_SIZE_K)
@@ -251,13 +257,6 @@ def triton_matmul4(a: torch.FloatTensor, qweight: torch.IntTensor, scales: torch
 	# This is based on the maximum BLOCK_SIZE_N; for our use cases (LLMs) we expect N to be large and a power of two
 	assert N % 256 == 0, "N must be a multiple of 256"
 
-	# Unpack zeros into (1, N) float16
-	zeros = qzeros.flatten()  # (N//8,) int32
-	zeros = torch.repeat_interleave(zeros, 8)  # ((N//8)*8,) int32
-	shifter = (torch.arange(0, N, device='cuda', dtype=torch.int32) % 8) * 4
-	zeros = (zeros >> shifter) & 0xF  # (N,) int32
-	zeros = (zeros + 1) * scales[0]  # (N,) float16
-
 	c = torch.empty((M, N), device='cuda', dtype=torch.float16)
 	#debug = torch.empty((32*32, 128), device='cuda', dtype=torch.float32)
 	grid = lambda META: (
@@ -266,12 +265,12 @@ def triton_matmul4(a: torch.FloatTensor, qweight: torch.IntTensor, scales: torch
 	#grid = lambda META: (1,)  # For debugging
 	matmul4_kernel[grid](
 		x, qweight, c, #debug,
-		scales, zeros,
+		scales, qzeros,
 		M, N, K,
 		x.stride(0), x.stride(1),
 		qweight.stride(0), qweight.stride(1),
 		c.stride(0), c.stride(1),
-		scales.stride(1), zeros.stride(0),
+		scales.stride(1), qzeros.stride(1),
 		#debug.stride(0), debug.stride(1),
 	)
 

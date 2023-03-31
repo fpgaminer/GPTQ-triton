@@ -87,17 +87,17 @@ def calculate_perplexity(model, tokenizer, dataset: str, max_length: int, stride
 	nlls = []
 	prev_end_loc = 0
 
-	for begin_loc in tqdm(range(0, seq_len - 1, stride)):
-		torch.cuda.synchronize()
+	for begin_loc in (pbar := tqdm(range(0, seq_len - 1, stride))):
 		end_loc = min(seq_len - 1, begin_loc + max_length)
 		trg_len = end_loc - prev_end_loc  # How many tokens we want to predict
 		input_ids = encodings[:, begin_loc:end_loc+1].to('cuda')  # +1 for the labels
 
 		with torch.no_grad():
 			# Ask the model for logits
-			outputs = model(input_ids[:, :-1])
-			# We only want the last trg_len logits
-			logits = outputs.logits[..., -trg_len:, :].contiguous()
+			# NOTE: Instead of calling HF's model wrapper, we call the model directly to hopefully cut down on some memory overhead
+			outputs = model.model(input_ids[:, :-1])
+			logits = model.lm_head(outputs[0][..., -trg_len:, :])
+
 			# The last trg_len tokens are the labels
 			labels = input_ids[:, -trg_len:].contiguous()
 
@@ -105,7 +105,9 @@ def calculate_perplexity(model, tokenizer, dataset: str, max_length: int, stride
 			loss_fct = nn.CrossEntropyLoss()
 			loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
 		
-		nlls.append(loss)
+		nlls.append(loss.to('cpu').to(torch.float32))
+		ppl = torch.exp(torch.stack(nlls).mean())
+		pbar.set_description(f"Perplexity: {ppl:.2f}")
 
 		prev_end_loc = end_loc
 		if end_loc == (seq_len - 1):

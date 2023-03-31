@@ -27,23 +27,29 @@ This benchmark was run on a 3090 using the `Benchmark.ipynb` notebook.
 ![Triton benchmark graph](TritonBench.png)
 
 
-## Accuracy
+## Accuracy (PPL)
 
 The following results were obtained using the `ppl.py` script with a stride of 512 and a context length of 2048.
 For the 4bit CUDA results, a custom version of `ppl.py` was used, as the current script is dedicated to the Triton kernel convensions.
+it/s numbers are from a 3090.
 
 
 | [LLaMA-7B](https://arxiv.org/abs/2302.13971)       | Bits | group-size | memory(MiB) | it/s | Wikitext2 |  PTB  |  C4  | 
 | -------------------------------------------------- | ---- | ---------- | ----------- | ---- | --------- | ----- | ---- |
 | FP16                                               |  16  |      -     |    17373    | 1.64 |    5.04   |  7.85 | 6.99 |
 | GPTQ CUDA                                          |   4  |     -1     |     8805    | 0.11 |    5.44   |  8.24 |   -  |
-| GPTQ Triton                                        |   4  |     -1     |     8611    | 1.52 |    5.44   |  8.24 | 7.48 |
+| GPTQ Triton                                        |   4  |     -1     |     8099    | 1.63 |    5.44   |  8.24 | 7.48 |
 
 
 | [LLaMA-13B](https://arxiv.org/abs/2302.13971)      | Bits | group-size | memory(MiB) | it/s | Wikitext2 |  PTB  |  C4  |
 | -------------------------------------------------- | ---- | ---------- | ----------- | ---- | --------- | ----- | ---- |
-| FP16                                               |  16  |      -     |    OOM      |   -  |       -   |    -  |   -  |
+| FP16                                               |  16  |      -     |    31633    |   -  |    4.52   |  7.19 | 6.66 |
 | GPTQ Triton                                        |   4  |     -1     |    13241    | 0.89 |    4.74   |  7.49 | 7.00 |
+
+
+| [LLaMA-30B](https://arxiv.org/abs/2302.13971)      | Bits | group-size | memory(MiB) | it/s | Wikitext2 |  PTB  |  C4  |
+| -------------------------------------------------- | ---- | ---------- | ----------- | ---- | --------- | ----- | ---- |
+| FP16                                               |  16  |      -     |    72491    |   -  |    3.61   |  6.50 | 6.07 |
 
 
 
