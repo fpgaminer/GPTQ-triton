@@ -296,3 +296,14 @@ def make_quant(module, names, bits, groupsize, faster=False, name=''):
             )
     for name1, child in module.named_children():
         make_quant(child, names, bits, groupsize, faster, name + '.' + name1 if name != '' else name1)
+
+
+def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
+    if type(module) in layers:
+        return {name: module}
+    res = {}
+    for name1, child in module.named_children():
+        res.update(find_layers(
+            child, layers=layers, name=name + '.' + name1 if name != '' else name1
+        ))
+    return res

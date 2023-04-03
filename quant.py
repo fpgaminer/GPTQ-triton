@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 from typing import Optional
 
+import custom_autotune
 import torch
 import torch.nn as nn
 import transformers
@@ -11,7 +12,7 @@ import triton.language as tl
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
 
-def load_quant(checkpoint: str):
+def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[str] = 'cuda'):
 	"""
 	Load a quantized model from a checkpoint.
 	"""
@@ -61,10 +62,49 @@ def load_quant(checkpoint: str):
 			if (m.bias == 0).all():
 				m.bias = None
 	
+	# Move the model to the correct device
+	if device is not None:
+		model = model.to(device)
+	
+	# Warm up the autotune cache
+	if warmup_autotune:
+		if device is None:
+			raise ValueError("You must specify a device when warmup_autotune is True.")
+		
+		autotune_warmup(model)
+	
 	model.seqlen = 2048
 	print('Done.')
 
 	return model
+
+
+def autotune_warmup(model):
+	"""
+	Pre-tunes the quantized kernel
+	"""
+	from tqdm import tqdm
+
+	# Find all the QuantLinear layers
+	n_values = {}
+
+	for _, m in model.named_modules():
+		if not isinstance(m, QuantLinear):
+			continue
+
+		k = m.infeatures
+		n = m.outfeatures
+
+		n_values[n] = (m.qweight, m.scales, m.qzeros, k)
+
+	print(f'Found {len(n_values)} unique N values.')
+	
+	print('Warming up autotune cache ...')
+	for m in tqdm(range(0, 12)):
+		m = 2 ** m   # [1, 2048]
+		for n, (qweight, scales, qzeros, k) in n_values.items():
+			a = torch.randn(1, m, k, dtype=torch.float16, device='cuda')
+			triton_matmul4(a, qweight, scales, qzeros)
 
 
 def make_quant(model, bits, groupsize):
@@ -123,21 +163,33 @@ class QuantLinear(nn.Module):
 # This Triton kernel is adapted from the Triton matmul example
 # It unpacks the quantized weights and then performs the matmul like usual
 # It operates in FP16 mode
-@triton.autotune(
+@custom_autotune.autotune(
 	configs=[
-		triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-		triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-		triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+		# These weren't useful, at least on a 3090
+		#triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+		#triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+		#triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+		#triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+		#triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+
 		triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
 		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
 		triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
 		triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
 		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
 		triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-		triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+
+		# These provided a benefit on a 3090
+		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+		triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+		triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+		triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
 	],
-	key=['M', 'N', 'K'],
+	key=['M', 'N'],
+	nearest_power_of_two=True,
 )
 @triton.jit
 def matmul4_kernel(

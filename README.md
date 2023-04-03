@@ -93,3 +93,10 @@ Generation took 82.30 seconds
 Total tokens generated: 915
 Average generation speed: 11.12 tokens per second
 ```
+
+
+### Benchmarking
+
+The `Benchmark.ipynb` notebook can be used to benchmark the Triton kernel vs the CUDA kernel and original FP16 performance.  It also includes some verification code to ensure the Triton kernel is working correctly.
+
+`benchmark_generate.py` is a script that can be used to benchmark the aforementioned kernels in a "real world" scenario.  It tests how the kernels perform across a variety of context and generation lengths.
