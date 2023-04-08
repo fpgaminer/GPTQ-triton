@@ -5,22 +5,24 @@ This script measures "real world" performance by running the whole model in gene
 It tests a grid of prompt lengths and generation lengths, and saves the timing results to `results.json`.
 """
 import argparse
-import time
-import random
 import itertools
 import json
+import os
+import random
+import time
 
-import torch
-from quant import load_quant
-from transformers import AutoTokenizer, LlamaForCausalLM, LlamaConfig
-import transformers
 import original_quant
+import torch
+import transformers
+from quant import load_quant
+from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', type=str, help='Path to model, either a HuggingFace model or a quantized model')
 parser.add_argument('--quant', action='store_true', help='Whether the model is quantized')
 parser.add_argument('--cuda', type=str, help='Whether to use the old CUDA kernel and format; this must be set to the path to the CUDA quantized model, and --model must be set to a HF model')
+parser.add_argument('--average', type=int, default=10, help='Number of times to run each test to get an average')
 
 
 def main():
@@ -44,46 +46,69 @@ def main():
 	prompt_lengths = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 	max_lengths = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
-	lengths = list(itertools.product(prompt_lengths, max_lengths))
+	lengths = set(itertools.product(prompt_lengths, max_lengths))
 
+	# Remove lengths that we've already tested
+	if os.path.exists('results.jsonl'):
+		with open('results.jsonl', 'r') as f:
+			for line in f:
+				line = json.loads(line)
+				key = (line['prompt_length'], line['max_length'])
+				if key in lengths:
+					lengths.remove(key)
+	
 	# Shuffle the lengths so that we don't always test in the same order and get caching effects
+	lengths = list(lengths)
 	random.shuffle(lengths)
 
-	results = {}
+	with open('results.jsonl', 'a') as f:
+		for prompt_length, max_length in lengths:
+			print(f'Prompt length: {prompt_length}, max length: {max_length}')
 
-	for prompt_length, max_length in lengths:
-		print(f'Prompt length: {prompt_length}, max length: {max_length}')
+			results = []
 
-		# Generate a long random string
-		# We do this every time to avoid caching effects
-		prompt = ''.join(random.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?') for _ in range(2048 * 10))
+			for _ in range(args.average):
+				# Generate a long random string
+				# We do this every time to avoid caching effects
+				prompt = ''.join(random.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?') for _ in range(2048 * 10))
 
-		# Encode and crop down
-		encoded_prompt = tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt')
-		encoded_prompt = encoded_prompt[:, :prompt_length]
-		encoded_prompt = encoded_prompt.to('cuda')
+				# Encode and crop down
+				encoded_prompt = tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt')
+				encoded_prompt = encoded_prompt[:, :prompt_length]
+				encoded_prompt = encoded_prompt.to('cuda')
 
-		start_time = time.time()
-		output_sequences = model.generate(
-			input_ids=encoded_prompt,
-			max_length=max_length + prompt_length,
-			do_sample=True,
-			num_return_sequences=1,
-			suppress_tokens=[model.generation_config.eos_token_id],  # This prevents the sampler from ending early; it must generate max_length tokens
-		)
-		end_time = time.time()
+				start_time = time.time()
+				_ = model.generate(
+					input_ids=encoded_prompt,
+					max_length=max_length + prompt_length,
+					do_sample=True,
+					num_return_sequences=1,
+					suppress_tokens=[model.generation_config.eos_token_id],  # This prevents the sampler from ending early; it must generate max_length tokens
+				)
+				end_time = time.time()
 
-		gen_time = end_time - start_time
-		speed = max_length / gen_time
+				gen_time = end_time - start_time
+				speed = max_length / gen_time
 
-		results[(prompt_length, max_length)] = (gen_time, speed)
+				results.append((gen_time, speed))
+			
+			# Compute the average
+			avg_time = sum(t for t, _ in results) / len(results)
+			avg_speed = (max_length * len(results)) / sum(t for t, _ in results)
 
-		print(f'Generation took {end_time - start_time:.2f} seconds')
-		print(f'Average generation speed: {max_length / (end_time - start_time):.2f} tokens per second')
-		print()
-	
-	with open('results.json', 'w') as f:
-		json.dump({str(k): str(v) for k, v in results.items()}, f, indent=4)
+			print(f'Average generation time: {avg_time:.2f} seconds')
+			print(f'Average generation speed: {avg_speed:.2f} tokens per second')
+			print()
+
+			f.write(json.dumps({
+				'prompt_length': prompt_length,
+				'max_length': max_length,
+				'average_time': avg_time,
+				'average_speed': avg_speed,
+				'runs': results,
+			}))
+			f.write("\n")
+			f.flush()
 
 
 def get_llama(model: str):

@@ -2,8 +2,6 @@
 
 This is my attempt at implementing a Triton kernel for GPTQ inference.  This code is based on the [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa) codebase, which is itself based on the [GPTQ](https://github.com/IST-DASLab/gptq) codebase.
 
-Citation:
-
 ```
 @article{frantar-gptq,
   title={{GPTQ}: Accurate Post-training Compression for Generative Pretrained Transformers}, 
@@ -22,7 +20,7 @@ The implementation is based around the matmul tutorial from the Triton documenta
 
 ## Performance
 
-This benchmark was run on a 3090 using the `Benchmark.ipynb` notebook.
+This benchmark was run on a 3090 using the `benchmark_generate.py` script.
 
 ![Triton benchmark graph](TritonBench.png)
 
@@ -53,10 +51,7 @@ it/s numbers are from a 3090.
 
 
 
-
-## Usage
-
-### Converting a model
+## Converting a model
 
 You need a 4-bit quantized model, which you can either download or create yourself using the original GPTQ-for-LLaMa repo.  The Triton kernel is currently only implemented for 4-bits and groupsize -1.  Then the quantized model needs to be converted.  The Triton implementation is slightly different from the CUDA implementation, so a conversion script is provided.
 
@@ -65,38 +60,16 @@ You need a 4-bit quantized model, which you can either download or create yourse
 The conversion script will create a folder and save the converted model, along with configuration files.
 
 
-### Running PPL
+## Files
 
-The `ppl.py` script can be used to calculate the perplexity of a model against wikitext2, PTB, and C4.  Example usage:
+* `benchmark_generate.py` - A script for benchmarking generation speed at different prompt lengths and generation lengths.
 
-`./ppl.py --model <Path to an HF FP16 model>`
+* `Benchmark.ipynb` - A notebook for benchmarking the Triton kernel against the CUDA kernel and FP16.
 
-This will calculate PPL for an original FP16 model.
+* `convert_weights.py` - A script for converting a GPTQ-for-LLaMa quantized model to a format compatible with this repo.
 
-`./ppl.py --model <Path to the quantized folder> --quant`
+* `generate.py` - An example script for generating text from a model.  Example usage: `./generate.py --model <Path to your quantized model> --quant --prompt "Write a story about a duck: Once upon a time there was a duck" --temperature 0.6 --top-p 0.6 --repetition-penalty 1.1`
 
-This will calculate PPL for a quantized model.
+* `ppl.py` - A script for calculating the perplexity of a model against wikitext2, PTB, and C4.  This is useful for verifying correctness of the Triton kernel, comparing it to the CUDA kernel and the original FP16 model.
 
-This is useful for verifying correctness of the Triton kernel, comparing it to the CUDA kernel, and comparing it to the original FP16 model.
-
-
-### Generation
-
-An example script, `generate.py`, is provided for generating text from a model.  This is an example only, and should be modified to suit your needs.
-
-`./generate.py --model <Path to your quantized model> --quant --prompt "Write a story about a duck: Once upon a time there was a duck" --temperature 0.6 --top-p 0.6 --repetition-penalty 1.1`
-
-WARNING: The first time you run this script it might take a long time while it compiles and optimizes the Triton kernel for all the different input sizes.  This is normal, and subsequent runs should be much faster.  It's almost important to note that like all LLM generation tasks, token generation speed is a function of context length, and thus the above example will generate the first tokens quickly but then slow down as the context length increases.  On my 3090 with a 7B parameter model:
-
-```
-Generation took 82.30 seconds
-Total tokens generated: 915
-Average generation speed: 11.12 tokens per second
-```
-
-
-### Benchmarking
-
-The `Benchmark.ipynb` notebook can be used to benchmark the Triton kernel vs the CUDA kernel and original FP16 performance.  It also includes some verification code to ensure the Triton kernel is working correctly.
-
-`benchmark_generate.py` is a script that can be used to benchmark the aforementioned kernels in a "real world" scenario.  It tests how the kernels perform across a variety of context and generation lengths.
+* `Verify.ipynb` - A notebook for verifying the correctness of the Triton kernel.
