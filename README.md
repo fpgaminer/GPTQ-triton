@@ -50,6 +50,12 @@ it/s numbers are from a 3090.
 | FP16                                               |  16  |      -     |    72491    |   -  |    3.61   |  6.50 | 6.07 |
 
 
+## Requirements
+
+I haven't formalised the requirements yet, but generally nightly `transformers`; GPTQ-for-LLaMa to be able to quantize models and if you want to run comparison tests; triton 2.0; the usual other PyTorch requirements.
+
+**WARNING**: Please use a `transformers` commit _before_ 7dcd870.  There is a 10% performance regression at that commit.
+
 
 ## Converting a model
 
