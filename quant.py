@@ -1,21 +1,28 @@
+import itertools
 import json
-import math
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
-import custom_autotune
+import fused_mlp
+import quant_linear
 import torch
-import torch.nn as nn
 import transformers
-import triton
-import triton.language as tl
+from fused_attention import make_quant_attn, QuantLlamaAttention
+from fused_mlp import QuantLlamaMLP, make_fused_mlp
+from quant_linear import QuantLinear, make_quant, triton_matmul4
 from transformers import LlamaConfig, LlamaForCausalLM
-from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotary_pos_emb
 
 
-def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[str] = 'cuda'):
+def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[str] = 'cuda', fuse_mlp: bool = True):
 	"""
 	Load a quantized model from a checkpoint.
+	Args:
+		checkpoint: Path to the checkpoint directory.
+		warmup_autotune: If True, run a warmup autotune pass. Otherwise autotune will run during forward passes.
+		device: Device to run the model on; needed if warmup_autotune is True.
+		fuse_mlp: If True, replace the MLP layers with fused versions.
+	Returns:
+		The loaded model.
 	"""
 	quant_config = json.load(open(Path(checkpoint) / 'quant_config.json'))
 	wbits = quant_config['wbits']
@@ -65,6 +72,9 @@ def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[s
 				#print(f"Removed bias from {name}")
 	
 	make_quant_attn(model)
+
+	if fuse_mlp:
+		make_fused_mlp(model)
 	
 	# Move the model to the correct device
 	if device is not None:
@@ -85,433 +95,20 @@ def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[s
 
 def autotune_warmup(model):
 	"""
-	Pre-tunes the quantized kernel
+	The Triton kernels autotune themselves for specific input sizes.  But this takes time.
+	This function collects information on all possible input sizes for the different kernels
+	and then runs them through the autotuner.
+	The intended use is to run this on startup so the autotuner doesn't have to run during
+	actual inference.
 	"""
 	from tqdm import tqdm
 
-	# Find all the QuantLinear layers
-	kn_values = {}
+	warmups = itertools.chain(quant_linear.autotune_warmup(model), fused_mlp.autotune_warmup(model))
+	warmups = list(warmups)
 
-	for _, m in model.named_modules():
-		if not isinstance(m, QuantLinear):
-			continue
-
-		k = m.infeatures
-		n = m.outfeatures
-
-		kn_values[(k, n)] = (m.qweight, m.scales, m.qzeros)
-
-	print(f'Found {len(kn_values)} unique KN values.')
-	
 	print('Warming up autotune cache ...')
 	with torch.no_grad():
 		for m in tqdm(range(0, 12)):
-			m = 2 ** m   # [1, 2048]
-			for (k, n), (qweight, scales, qzeros) in kn_values.items():
-				a = torch.randn(1, m, k, dtype=torch.float16, device='cuda')
-				triton_matmul4(a, qweight, scales, qzeros)
-
-
-def make_quant(model, bits, groupsize):
-	"""
-	Replace all linear layers in a model with quantized ones.
-	Except for the lm_head, which is not quantized.
-	"""
-	for name, m in model.named_modules():
-		if not isinstance(m, torch.nn.Linear):
-			continue
-
-		if name == 'lm_head':
-			continue
-
-		# Replace the linear layer with a quantized one
-		qlayer = QuantLinear(bits, groupsize, m.in_features, m.out_features)
-		parent_name = name.rsplit('.', 1)[0]
-		parent = model.get_submodule(parent_name)
-
-		#print(f"Replacing {name} with quant; parent: {parent_name}, child's name: {name[len(parent_name) + 1:]}")
-
-		setattr(parent, name[len(parent_name) + 1:], qlayer)
-
-
-def make_quant_attn(model):
-	"""
-	Replace all LlamaAttention modules with QuantLlamaAttention modules, fusing the q, k, v projections.
-	"""
-	for name, m in model.named_modules():
-		if not isinstance(m, LlamaAttention):
-			continue
-
-		q_proj = m.q_proj
-		k_proj = m.k_proj
-		v_proj = m.v_proj
-
-		qweights = torch.cat([q_proj.qweight, k_proj.qweight, v_proj.qweight], dim=1)
-		qzeros = torch.cat([q_proj.qzeros, k_proj.qzeros, v_proj.qzeros], dim=1)
-		scales = torch.cat([q_proj.scales, k_proj.scales, v_proj.scales], dim=1)
-
-		qkv_layer = QuantLinear(4, -1, q_proj.infeatures, q_proj.outfeatures + k_proj.outfeatures + v_proj.outfeatures)
-		qkv_layer.qweight = qweights
-		qkv_layer.qzeros = qzeros
-		qkv_layer.scales = scales
-		qkv_layer.bias = None
-
-		attn = QuantLlamaAttention(m.hidden_size, m.num_heads, qkv_layer, m.o_proj, m.rotary_emb)
-
-		if '.' in name:
-			parent_name = name.rsplit('.', 1)[0]
-			child_name = name[len(parent_name) + 1:]
-			parent = model.get_submodule(parent_name)
-		else:
-			parent_name = ''
-			parent = model
-			child_name = name
-
-		#print(f"Replacing {name} with quant_attn; parent: {parent_name}, child's name: {child_name}")
-
-		setattr(parent, child_name, attn)
-
-
-class QuantLlamaAttention(nn.Module):
-	"""Multi-headed attention from 'Attention Is All You Need' paper"""
-
-	def __init__(
-		self,
-		hidden_size: int,
-		num_heads: int,
-		qkv_proj,
-		o_proj,
-		rotary_emb,
-	):
-		super().__init__()
-		self.hidden_size = hidden_size
-		self.num_heads = num_heads
-		self.head_dim = hidden_size // num_heads
-
-		if (self.head_dim * num_heads) != self.hidden_size:
-			raise ValueError(
-				f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-				f" and `num_heads`: {num_heads})."
-			)
-		self.qkv_proj = qkv_proj
-		self.o_proj = o_proj
-		self.rotary_emb = rotary_emb
-
-	def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-		return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-
-	def forward(
-		self,
-		hidden_states: torch.Tensor,
-		past_key_value: Optional[Tuple[torch.Tensor]] = None,
-		attention_mask: Optional[torch.Tensor] = None,
-		output_attentions: bool = False,
-		use_cache: bool = False,
-	) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-		"""Input shape: Batch x Time x Channel"""
-
-		bsz, q_len, _ = hidden_states.size()
-
-		qkv_states = self.qkv_proj(hidden_states)
-		query_states, key_states, value_states = torch.split(qkv_states, self.hidden_size, dim=2)
-
-		query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-		key_states = key_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-		value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-		kv_seq_len = key_states.shape[-2]
-		offset = 0
-		if past_key_value is not None:
-			offset = past_key_value[0].shape[-2]
-			kv_seq_len += offset
-		cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-		query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, offset=offset)
-		# [bsz, nh, t, hd]
-
-		if past_key_value is not None:
-			# reuse k, v, self_attention
-			key_states = torch.cat([past_key_value[0], key_states], dim=2)
-			value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-		past_key_value = (key_states, value_states) if use_cache else None
-
-		attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-		if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-			raise ValueError(
-				f"Attention weights should be of size {(bsz * self.num_heads, q_len, kv_seq_len)}, but is"
-				f" {attn_weights.size()}"
-			)
-
-		if attention_mask is not None:
-			if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-				raise ValueError(
-					f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-				)
-			attn_weights = attn_weights + attention_mask
-			attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
-
-		# upcast attention to fp32
-		attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-		attn_output = torch.matmul(attn_weights, value_states)
-
-		if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-			raise ValueError(
-				f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-				f" {attn_output.size()}"
-			)
-
-		attn_output = attn_output.transpose(1, 2)
-		attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-		attn_output = self.o_proj(attn_output)
-
-		if not output_attentions:
-			attn_weights = None
-
-		return attn_output, attn_weights, past_key_value
-
-
-class QuantLinear(nn.Module): 
-	def __init__(self, bits: int, groupsize: int, infeatures: int, outfeatures: int):
-		super().__init__()
-
-		if bits not in [4]:
-			raise NotImplementedError("Only 4 bits are supported.")
-		
-		if groupsize != -1:
-			raise NotImplementedError("Groupsize is not supported, must be -1.")
-		
-		groupsize = infeatures
-		
-		self.infeatures = infeatures
-		self.outfeatures = outfeatures
-		self.bits = bits
-		self.groupsize = groupsize
-
-		features_per_int = 32 // bits
-
-		assert outfeatures % features_per_int == 0, "outfeatures must be a multiple of features_per_int"
-
-		self.register_buffer('qweight', torch.zeros((infeatures // features_per_int, outfeatures), dtype=torch.int32))
-		self.register_buffer('qzeros', torch.zeros((math.ceil(infeatures / groupsize), outfeatures // features_per_int), dtype=torch.int32))
-		self.register_buffer('scales', torch.zeros((math.ceil(infeatures / groupsize), outfeatures), dtype=torch.float16))
-		self.register_buffer('bias', torch.zeros(outfeatures, dtype=torch.float16))
-
-	def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
-		y = triton_matmul4(x, self.qweight, self.scales, self.qzeros, self.bias)
-		return y
-
-
-def matmul4_kernel_config_pruner(configs, nargs):
-	"""
-	The main purpose of this function is to shrink BLOCK_SIZE_* when the corresponding dimension is smaller.
-	"""
-	m = max(2 ** int(math.ceil(math.log2(nargs['M']))), 16)
-	n = max(2 ** int(math.ceil(math.log2(nargs['N']))), 16)
-	k = max(2 ** int(math.ceil(math.log2(nargs['K']))), 16)
-
-	used = set()
-	for config in configs:
-		block_size_m = min(m, config.kwargs['BLOCK_SIZE_M'])
-		block_size_n = min(n, config.kwargs['BLOCK_SIZE_N'])
-		block_size_k = min(k, config.kwargs['BLOCK_SIZE_K'])
-		group_size_m = config.kwargs['GROUP_SIZE_M']
-
-		if (block_size_m, block_size_n, block_size_k, group_size_m, config.num_stages, config.num_warps) in used:
-			continue
-
-		used.add((block_size_m, block_size_n, block_size_k, group_size_m, config.num_stages, config.num_warps))
-		yield triton.Config({'BLOCK_SIZE_M': block_size_m, 'BLOCK_SIZE_N': block_size_n, 'BLOCK_SIZE_K': block_size_k, 'GROUP_SIZE_M': group_size_m}, num_stages=config.num_stages, num_warps=config.num_warps)
-
-
-# This Triton kernel is adapted from the Triton matmul example
-# It unpacks the quantized weights and then performs the matmul like usual
-# It operates in FP16 mode
-@custom_autotune.autotune(
-	configs=[
-		# These weren't useful, at least on a 3090
-		#triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-		#triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-		#triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-		#triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-		#triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-
-		#triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-		triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-		#triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-		triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-
-		# These provided a benefit on a 3090
-		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=8),
-		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-		triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
-
-		# From PyTorch Inductor
-		#triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
-		#triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
-		#triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
-		#triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
-
-		#triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
-		#triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=8),
-		#triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=8),
-
-		#triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8}, num_stages=1, num_warps=2),
-	],
-	key=['M', 'N', 'K'],
-	nearest_power_of_two=True,
-	prune_configs_by={
-		'early_config_prune': matmul4_kernel_config_pruner,
-		'perf_model': None,
-		'top_k': None,
-	},
-)
-@triton.jit
-def matmul4_kernel(
-	a_ptr, b_ptr, c_ptr, #debug_ptr,
-	scales_ptr, zeros_ptr,
-	M, N, K,
-	stride_am, stride_ak,
-	stride_bk, stride_bn,
-	stride_cm, stride_cn,
-	stride_scales, stride_zeros, #stride_dk, stride_dn,
-	BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-	GROUP_SIZE_M: tl.constexpr,
-):
-	"""
-	Compute the matrix multiplication C = A x B.
-	A is of shape (M, K) float16
-	B is of shape (K//8, N) int32
-	C is of shape (M, N) float16
-	scales is of shape (1, N) float16
-	zeros is of shape (1, N//8) int32
-
-	WARNING: This kernel assumes that K is a multiple of BLOCK_SIZE_K.
-	WARNING: This kernel assumes that N is a multiple of BLOCK_SIZE_N.
-	"""
-	pid = tl.program_id(axis=0)
-	num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-	num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-	num_pid_k = tl.cdiv(K, BLOCK_SIZE_K)
-	num_pid_in_group = GROUP_SIZE_M * num_pid_n
-	group_id = pid // num_pid_in_group
-	first_pid_m = group_id * GROUP_SIZE_M
-	group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-	pid_m = first_pid_m + (pid % group_size_m)
-	pid_n = (pid % num_pid_in_group) // group_size_m
-
-	offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-	offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-	offs_k = tl.arange(0, BLOCK_SIZE_K)
-	a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)   # (BLOCK_SIZE_M, BLOCK_SIZE_K)
-	a_mask = (offs_am[:, None] < M)
-	# b_ptrs is set up such that it repeats elements along the K axis 8 times
-	b_ptrs = b_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-	scales_ptrs = scales_ptr + offs_bn * stride_scales
-	# zeros_ptrs is set up such that it repeats elements along the N axis 8 times
-	zeros_ptrs = zeros_ptr + (offs_bn // 8) * stride_zeros
-
-	# shifter is used to extract the 4 bits of each element in the 32-bit word from B and zeros
-	shifter = (offs_k % 8) * 4
-	zeros_shifter = (offs_bn % 8) * 4
-
-	# Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
-	scales = tl.load(scales_ptrs)  # (BLOCK_SIZE_N,)
-	zeros = tl.load(zeros_ptrs)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
-
-	# Unpack zeros
-	zeros = (zeros >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
-	zeros = (zeros + 1) * scales  # (BLOCK_SIZE_N,) float16
-
-	# For debugging
-	#offs_dk = 0 + tl.arange(0, BLOCK_SIZE_K)
-	#offs_dn = 0 + tl.arange(0, BLOCK_SIZE_N)
-	#debug_ptrs = debug_ptr + stride_dk * offs_dk[:, None] + stride_dn * offs_dn[None, :]
-	#tl.store(debug_ptrs, b)
-
-	# Now calculate a block of output of shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
-	# M is along the batch dimension, N is along the outfeatures dimension, K is along the infeatures dimension
-	# So this loop is along the infeatures dimension (K)
-	# It's calculating BLOCK_SIZE_M batches in parallel, and for each batch, BLOCK_SIZE_N outfeatures in parallel
-	accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-	for k in range(0, num_pid_k):
-		a = tl.load(a_ptrs, mask=a_mask, other=0.)   # (BLOCK_SIZE_M, BLOCK_SIZE_K)
-		b = tl.load(b_ptrs)   # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
-
-		# Now we need to unpack b (which is 4-bit values) into 32-bit values
-		b = (b >> shifter[:, None]) & 0xF  # Extract the 4-bit values
-		b = b * scales[None, :] - zeros[None, :]  # Scale and shift
-		#tl.store(debug_ptrs, b)
-
-		accumulator += tl.dot(a, b)
-		a_ptrs += BLOCK_SIZE_K * stride_ak
-		b_ptrs += (BLOCK_SIZE_K // 8) * stride_bk
-		#debug_ptrs += BLOCK_SIZE_K * stride_dk
-	
-	c = accumulator.to(tl.float16)
-	
-	# Store the result
-	offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-	offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-	c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-	c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-	tl.store(c_ptrs, accumulator, mask=c_mask)
-
-
-def triton_matmul4(a: torch.FloatTensor, qweight: torch.IntTensor, scales: torch.FloatTensor, qzeros: torch.IntTensor, bias: Optional[torch.FloatTensor] = None) -> torch.FloatTensor:
-	"""
-	Compute the matrix multiplication C = A x B + bias.
-	Where B is quantized using GPTQ and groupsize = -1 into 4-bit values.
-
-	A is of shape (..., K) float16
-	qweight is of shape (K//8, N) int32
-	scales is of shape (1, N) float16
-	qzeros is of shape (1, N//8) int32
-	bias is of shape (1, N) float16
-
-	Returns C of shape (..., N) float16
-	"""
-	assert a.shape[-1] == (qweight.shape[0] * 8), "A must be a multiple of 8 in the last dimension"
-	assert a.is_contiguous(), "A must be contiguous"
-
-	# Flatten a into (-1, K)
-	x = a.view(-1, a.shape[-1])
-
-	M, K = x.shape
-	N = qweight.shape[1]
-	# This is based on the possible BLOCK_SIZE_Ks
-	assert K % 16 == 0 and K % 32 == 0 and K % 64 == 0 and K % 128 == 0, "K must be a multiple of 16, 32, 64, and 128"
-	# This is based on the maximum BLOCK_SIZE_N
-	assert N % 16 == 0 and N % 32 == 0 and N % 64 == 0 and N % 128 == 0 and N % 256 == 0, "N must be a multiple of 16, 32, 64, 128, and 256"
-
-	c = torch.empty((M, N), device='cuda', dtype=torch.float16)
-	#debug = torch.empty((32*32, 128), device='cuda', dtype=torch.float32)
-
-	grid = lambda META: (
-		triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
-	)
-	#grid = lambda META: (1,)  # For debugging
-	matmul4_kernel[grid](
-		x, qweight, c, #debug,
-		scales, qzeros,
-		M, N, K,
-		x.stride(0), x.stride(1),
-		qweight.stride(0), qweight.stride(1),
-		c.stride(0), c.stride(1),
-		scales.stride(1), qzeros.stride(1),
-		#debug.stride(0), debug.stride(1),
-	)
-
-	# Reshape c
-	c = c.view(a.shape[:-1] + (N,))  # (..., N)
-
-	# Add bias
-	if bias is not None:
-		c = c + bias
-	
-	return c
-	#return debug
+			m = 2 ** m
+			for func in warmups:
+				func(m)

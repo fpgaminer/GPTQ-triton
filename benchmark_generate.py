@@ -61,6 +61,17 @@ def main():
 	lengths = list(lengths)
 	random.shuffle(lengths)
 
+	# TODO: For some reason the first run is always slow, so we run it once before the benchmark to warm things up
+	encoded_prompt = tokenizer.encode("TODO", add_special_tokens=False, return_tensors='pt').to('cuda')
+	_ = model.generate(
+		input_ids=encoded_prompt,
+		max_length=8,
+		do_sample=True,
+		num_return_sequences=1,
+		suppress_tokens=[model.generation_config.eos_token_id],
+	)
+
+	# Run the remaining benchmarks
 	with open('results.jsonl', 'a') as f:
 		for prompt_length, max_length in lengths:
 			print(f'Prompt length: {prompt_length}, max length: {max_length}')

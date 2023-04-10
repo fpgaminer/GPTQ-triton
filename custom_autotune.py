@@ -45,6 +45,8 @@ class Autotuner(triton.KernelInterface):
 		self.perf_model, self.configs_top_k = perf_model, top_k
 		self.early_config_prune = early_config_prune
 		self.fn = fn
+		self.record_detailed_timings = False
+		self.detailed_timings = {}
 
 	def _bench(self, *args, config, **meta):
 		# check for conflicts, i.e. meta-parameters both provided
@@ -91,6 +93,9 @@ class Autotuner(triton.KernelInterface):
 				self.cache[key] = builtins.min(timings, key=timings.get)
 				self.hook(args)
 				self.configs_timings = timings
+
+				if self.record_detailed_timings:
+					self.detailed_timings[key] = timings
 			config = self.cache[key]
 		else:
 			config = self.configs[0]

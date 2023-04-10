@@ -6,7 +6,7 @@ import torch.nn as nn
 from datasets import load_dataset
 from quant import load_quant
 from tqdm import tqdm
-from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
+from transformers import AutoTokenizer, LlamaForCausalLM
 
 
 parser = argparse.ArgumentParser()
