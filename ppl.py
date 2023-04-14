@@ -4,7 +4,7 @@ import argparse
 import torch
 import torch.nn as nn
 from datasets import load_dataset
-from quant import load_quant
+from gptq_triton import load_quant
 from tqdm import tqdm
 from transformers import AutoTokenizer, LlamaForCausalLM
 

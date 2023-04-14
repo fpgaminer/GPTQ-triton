@@ -6,7 +6,7 @@ import argparse
 import time
 
 import torch
-from quant import load_quant
+from gptq_triton import load_quant
 from transformers import AutoTokenizer, LlamaForCausalLM
 
 

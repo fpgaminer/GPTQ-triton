@@ -14,7 +14,7 @@ import time
 import original_quant
 import torch
 import transformers
-from quant import load_quant
+from gptq_triton import load_quant
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
 

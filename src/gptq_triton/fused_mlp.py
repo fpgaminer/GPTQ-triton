@@ -1,12 +1,13 @@
 import functools
 
-import custom_autotune
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 from transformers.models.llama.modeling_llama import LlamaMLP
-from utils import matmul4_kernel_config_pruner
+
+from . import custom_autotune
+from .utils import matmul4_kernel_config_pruner
 
 
 def make_fused_mlp(m, parent_name=''):

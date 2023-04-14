@@ -3,14 +3,14 @@ import json
 from pathlib import Path
 from typing import Optional
 
-import fused_mlp
-import quant_linear
 import torch
 import transformers
-from fused_attention import make_quant_attn, QuantLlamaAttention
-from fused_mlp import QuantLlamaMLP, make_fused_mlp
-from quant_linear import QuantLinear, make_quant, triton_matmul4
 from transformers import LlamaConfig, LlamaForCausalLM
+
+from . import fused_mlp, quant_linear
+from .fused_attention import QuantLlamaAttention, make_quant_attn
+from .fused_mlp import QuantLlamaMLP, make_fused_mlp
+from .quant_linear import QuantLinear, make_quant, triton_matmul4
 
 
 def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[str] = 'cuda', fuse_mlp: bool = True):

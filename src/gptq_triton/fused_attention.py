@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from quant_linear import QuantLinear
+from .quant_linear import QuantLinear
 from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotary_pos_emb
 
 
