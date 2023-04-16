@@ -29,7 +29,8 @@ def main():
 		model.eval()
 		model.to('cuda')
 	
-	tokenizer = AutoTokenizer.from_pretrained(args.model)
+	# NOTE: Setting use_fast=False for now, as the alternative was an order of magnitude slower on a recent `transformers` commit
+	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	context_length = model.seqlen if args.context_length is None else args.context_length
 
 	for dataset in ['wikitext-2', 'ptb', 'c4']:
@@ -77,9 +78,11 @@ def get_dataset(dataset_name: str, tokenizer) -> torch.Tensor:
 
 
 def calculate_perplexity(model, tokenizer, dataset: str, max_length: int, stride: int = 512) -> float:
+	print("Loading dataset...")
 	encodings = get_dataset(dataset, tokenizer)
 	seq_len = encodings.size(1)
 
+	print("Calculating perplexity...")
 	print(f"Sequence length: {seq_len}")
 	print(f"Max length: {max_length}")
 	print(f"Stride: {stride}")

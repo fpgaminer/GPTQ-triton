@@ -11,11 +11,18 @@ This is my attempt at implementing a Triton kernel for GPTQ inference.  This cod
 }
 ```
 
+## Installation
+
+`pip install .`
+
+
 ## Motivation
 
 As of today (2023-03-27) the CUDA kernels in the aforementioned codebases do not scale well with context length, running up to 10x slower when the context is large versus the equivilent FP16 model.  To solve this I'm implementing the inference kernel in Triton, which should allow for much better scaling.
 
 The implementation is based around the matmul tutorial from the Triton documentation.  The main difference is decoding the quantized weights before performing each sub-block of the matrix multiplication.
+
+Fusing of the FF layers and QKV matrix are also applied.
 
 
 ## Performance
@@ -52,18 +59,30 @@ it/s numbers are from a 3090.
 
 ## Requirements
 
-I haven't formalised the requirements yet, but generally nightly `transformers`; GPTQ-for-LLaMa to be able to quantize models and if you want to run comparison tests; triton 2.0; the usual other PyTorch requirements.
-
-**WARNING**: Please use a `transformers` commit _before_ 7dcd870.  There is a 10% performance regression at that commit.
+See `setup.cfg`, but note that a nightly `transformers` is preferred right now. v4.28.1 might work.  Known working `transformers` commit is `28f26c107b4a1c5c7e32ed4d9575622da0627a40`.
 
 
-## Converting a model
+## Quantizing a model
 
-You need a 4-bit quantized model, which you can either download or create yourself using the original GPTQ-for-LLaMa repo.  The Triton kernel is currently only implemented for 4-bits and groupsize -1.  Then the quantized model needs to be converted.  The Triton implementation is slightly different from the CUDA implementation, so a conversion script is provided.
+The `quantize.py` script is used to quantize HuggingFace model.  Example usage:
 
-`./convert_weights.py --model <Path to a HF FP16 model> --quant <Path to the quantized pt file> --output <Path to the output folder>`
+`./quantize.py --model <Path to a HF FP16 model> --dataset c4 --wbits 4 --groupsize -1 --act-order --true-sequential --save <Path to the output folder>`
 
-The conversion script will create a folder and save the converted model, along with configuration files.
+Arguments:
+
+* `--model`: Path to a HF FP16 model
+* `--dataset`: Dataset to use for calibration.  Can be `wikitext-2`, `ptb`, `ptb-new` or `c4`.
+* `--seed`: Seed for sampling the calibration data.
+* `--nsamples`: Number of calibration data samples.
+* `--percdamp`: Percent of the average Hessian diagonal to use for dampening.
+* `--wbits`: Number of bits to use for quantization.
+* `--groupsize`: Groupsize to use for quantization; default (-1) uses full row.
+* `--save`: Save quantized result to this folder.
+* `--safetensors`: Save using the safetensors format.
+* `--act-order`: Use activation order quantization.
+* `--true-sequential`: Use true sequential quantization.
+
+**NOTE:** The Triton kernel is currently only implemented for 4-bits and groupsize -1.
 
 
 ## Files
@@ -72,7 +91,7 @@ The conversion script will create a folder and save the converted model, along w
 
 * `Benchmark.ipynb` - A notebook for benchmarking the Triton kernel against the CUDA kernel and FP16.
 
-* `convert_weights.py` - A script for converting a GPTQ-for-LLaMa quantized model to a format compatible with this repo.
+* `quantize.py` - A script for quantizing a model.
 
 * `generate.py` - An example script for generating text from a model.  Example usage: `./generate.py --model <Path to your quantized model> --quant --prompt "Write a story about a duck: Once upon a time there was a duck" --temperature 0.6 --top-p 0.6 --repetition-penalty 1.1`
 

@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from .quant_linear import QuantLinear
-from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotary_pos_emb
+from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotary_pos_emb, LlamaConfig
 
 
 def make_quant_attn(model):
@@ -23,13 +23,13 @@ def make_quant_attn(model):
 		qzeros = torch.cat([q_proj.qzeros, k_proj.qzeros, v_proj.qzeros], dim=1)
 		scales = torch.cat([q_proj.scales, k_proj.scales, v_proj.scales], dim=1)
 
-		qkv_layer = QuantLinear(4, -1, q_proj.infeatures, q_proj.outfeatures + k_proj.outfeatures + v_proj.outfeatures)
+		qkv_layer = QuantLinear(4, -1, q_proj.infeatures, q_proj.outfeatures + k_proj.outfeatures + v_proj.outfeatures, bias=False)
 		qkv_layer.qweight = qweights
 		qkv_layer.qzeros = qzeros
 		qkv_layer.scales = scales
 		qkv_layer.bias = None
 
-		attn = QuantLlamaAttention(m.hidden_size, m.num_heads, qkv_layer, m.o_proj, m.rotary_emb)
+		attn = QuantLlamaAttention(m.config, qkv_layer, m.o_proj, m.rotary_emb)
 
 		if '.' in name:
 			parent_name = name.rsplit('.', 1)[0]
@@ -52,21 +52,22 @@ class QuantLlamaAttention(nn.Module):
 
 	def __init__(
 		self,
-		hidden_size: int,
-		num_heads: int,
+		config: LlamaConfig,
 		qkv_proj,
 		o_proj,
 		rotary_emb,
 	):
 		super().__init__()
-		self.hidden_size = hidden_size
-		self.num_heads = num_heads
-		self.head_dim = hidden_size // num_heads
+		self.config = config
+		self.hidden_size = config.hidden_size
+		self.num_heads = config.num_attention_heads
+		self.head_dim = self.hidden_size // self.num_heads
+		self.max_position_embeddings = config.max_position_embeddings
 
-		if (self.head_dim * num_heads) != self.hidden_size:
+		if (self.head_dim * self.num_heads) != self.hidden_size:
 			raise ValueError(
 				f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-				f" and `num_heads`: {num_heads})."
+				f" and `num_heads`: {self.num_heads})."
 			)
 		self.qkv_proj = qkv_proj
 		self.o_proj = o_proj
@@ -78,13 +79,13 @@ class QuantLlamaAttention(nn.Module):
 	def forward(
 		self,
 		hidden_states: torch.Tensor,
-		past_key_value: Optional[Tuple[torch.Tensor]] = None,
 		attention_mask: Optional[torch.Tensor] = None,
+		position_ids: Optional[torch.LongTensor] = None,
+		past_key_value: Optional[Tuple[torch.Tensor]] = None,
 		output_attentions: bool = False,
 		use_cache: bool = False,
 	) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 		"""Input shape: Batch x Time x Channel"""
-
 		bsz, q_len, _ = hidden_states.size()
 
 		qkv_states = self.qkv_proj(hidden_states)
@@ -95,12 +96,10 @@ class QuantLlamaAttention(nn.Module):
 		value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
 		kv_seq_len = key_states.shape[-2]
-		offset = 0
 		if past_key_value is not None:
-			offset = past_key_value[0].shape[-2]
-			kv_seq_len += offset
+			kv_seq_len += past_key_value[0].shape[-2]
 		cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-		query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, offset=offset)
+		query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 		# [bsz, nh, t, hd]
 
 		if past_key_value is not None:

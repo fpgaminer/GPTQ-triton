@@ -60,14 +60,14 @@ def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[s
 		from safetensors.torch import load_file as safe_load
 		model.load_state_dict(safe_load(Path(checkpoint) / 'model.safetensors'))
 	elif (Path(checkpoint) / 'model.pt').exists():
-		model.load_state_dict(torch.load(Path(checkpoint) / 'model.pt'))
+		model.load_state_dict(torch.load(Path(checkpoint) / 'model.pt'), strict=False)
 	else:
 		raise FileNotFoundError(f"Could not find model checkpoint at {checkpoint}; please ensure that the path is correct and contains a `model.pt` or `model.safetensors` file.")
 	
 	# Go through all the QuantLinear layers and if their bias is all zeros, set it to None
 	for name, m in model.named_modules():
 		if isinstance(m, QuantLinear):
-			if (m.bias == 0).all():
+			if m.bias is not None and (m.bias == 0).all():
 				m.bias = None
 				#print(f"Removed bias from {name}")
 	

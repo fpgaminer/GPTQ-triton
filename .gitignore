@@ -1,3 +1,6 @@
 __pycache__
 *.json
 *.jsonl
+/build
+/dist
+*.egg-info

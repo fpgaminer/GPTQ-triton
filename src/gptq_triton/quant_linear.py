@@ -23,7 +23,7 @@ def make_quant(model, bits, groupsize):
 			continue
 
 		# Replace the linear layer with a quantized one
-		qlayer = QuantLinear(bits, groupsize, m.in_features, m.out_features)
+		qlayer = QuantLinear(bits, groupsize, m.in_features, m.out_features, m.bias is not None)
 		parent_name = name.rsplit('.', 1)[0]
 		parent = model.get_submodule(parent_name)
 
@@ -47,7 +47,7 @@ def autotune_warmup(model):
 
 
 class QuantLinear(nn.Module):
-	def __init__(self, bits: int, groupsize: int, infeatures: int, outfeatures: int):
+	def __init__(self, bits: int, groupsize: int, infeatures: int, outfeatures: int, bias: bool):
 		super().__init__()
 
 		if bits not in [4]:
@@ -67,10 +67,13 @@ class QuantLinear(nn.Module):
 
 		assert outfeatures % features_per_int == 0, "outfeatures must be a multiple of features_per_int"
 
-		self.register_buffer('qweight', torch.zeros((infeatures // features_per_int, outfeatures), dtype=torch.int32))
-		self.register_buffer('qzeros', torch.zeros((math.ceil(infeatures / groupsize), outfeatures // features_per_int), dtype=torch.int32))
-		self.register_buffer('scales', torch.zeros((math.ceil(infeatures / groupsize), outfeatures), dtype=torch.float16))
-		self.register_buffer('bias', torch.zeros(outfeatures, dtype=torch.float16))
+		self.register_buffer('qweight', torch.empty((infeatures // features_per_int, outfeatures), dtype=torch.int32))
+		self.register_buffer('qzeros', torch.empty((math.ceil(infeatures / groupsize), outfeatures // features_per_int), dtype=torch.int32))
+		self.register_buffer('scales', torch.empty((math.ceil(infeatures / groupsize), outfeatures), dtype=torch.float16))
+		if bias:
+			self.register_buffer('bias', torch.empty(outfeatures, dtype=torch.float16))
+		else:
+			self.register_parameter('bias', None)
 
 	def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
 		y = triton_matmul4(x, self.qweight, self.scales, self.qzeros, self.bias)
