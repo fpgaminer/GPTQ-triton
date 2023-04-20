@@ -35,15 +35,15 @@ def make_quant(model, bits, groupsize):
 def autotune_warmup(model):
 	# Find all the QuantLinear layers
 	modules = (m for m in model.modules() if isinstance(m, QuantLinear))
-	kn_values = {(m.infeatures, m.outfeatures): (m.qweight, m.scales, m.qzeros) for m in modules}
+	kn_values = {(m.infeatures, m.outfeatures): (m.qweight, m.scales, m.qzeros, m.groupsize) for m in modules}
 
 	print(f'QuantLinear Warmup: Found {len(kn_values)} unique KN values.')
 
-	def func(m, k, qweight, scales, qzeros):
+	def func(m, k, qweight, scales, qzeros, groupsize):
 		a = torch.randn(1, m, k, dtype=torch.float16, device='cuda')
-		triton_matmul4(a, qweight, scales, qzeros)
+		triton_matmul4(groupsize, a, qweight, scales, qzeros)
 	
-	return (functools.partial(func, k=k, qweight=qweight, scales=scales, qzeros=qzeros) for (k, n), (qweight, scales, qzeros) in kn_values.items())
+	return (functools.partial(func, k=k, qweight=qweight, scales=scales, qzeros=qzeros, groupsize=groupsize) for (k, n), (qweight, scales, qzeros, groupsize) in kn_values.items())
 
 
 class QuantLinear(nn.Module):
@@ -53,10 +53,7 @@ class QuantLinear(nn.Module):
 		if bits not in [4]:
 			raise NotImplementedError("Only 4 bits are supported.")
 		
-		if groupsize != -1:
-			raise NotImplementedError("Groupsize is not supported, must be -1.")
-		
-		groupsize = infeatures
+		groupsize = infeatures if groupsize == -1 else groupsize
 		
 		self.infeatures = infeatures
 		self.outfeatures = outfeatures
@@ -76,7 +73,7 @@ class QuantLinear(nn.Module):
 			self.register_parameter('bias', None)
 
 	def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
-		y = triton_matmul4(x, self.qweight, self.scales, self.qzeros, self.bias)
+		y = triton_matmul4(self.groupsize, x, self.qweight, self.scales, self.qzeros, self.bias)
 		return y
 
 
@@ -117,8 +114,8 @@ class QuantLinear(nn.Module):
 
 		#triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8}, num_stages=1, num_warps=2),
 	],
-	key=['M', 'N', 'K'],
-	nearest_power_of_two=True,
+	key=['M', 'N', 'K', 'NO_GROUPS'],
+	nearest_power_of_two=['M', 'N', 'K'],
 	prune_configs_by={
 		'early_config_prune': matmul4_kernel_config_pruner,
 		'perf_model': None,
@@ -127,13 +124,15 @@ class QuantLinear(nn.Module):
 )
 @triton.jit
 def matmul4_kernel(
-	a_ptr, b_ptr, c_ptr, #debug_ptr,
+	a_ptr, b_ptr, c_ptr,
 	scales_ptr, zeros_ptr,
 	M, N, K,
 	stride_am, stride_ak,
 	stride_bk, stride_bn,
 	stride_cm, stride_cn,
-	stride_scales, stride_zeros, #stride_dk, stride_dn,
+	stride_scales_g, stride_scales_n,
+	stride_zeros_g, stride_zeros_n,
+	groupsize, NO_GROUPS: tl.constexpr,
 	BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
 	GROUP_SIZE_M: tl.constexpr,
 ):
@@ -142,11 +141,15 @@ def matmul4_kernel(
 	A is of shape (M, K) float16
 	B is of shape (K//8, N) int32
 	C is of shape (M, N) float16
-	scales is of shape (1, N) float16
-	zeros is of shape (1, N//8) int32
+	scales is of shape (G, N) float16
+	zeros is of shape (G, N//8) int32
+	groupsize is an int specifying the size of groups for scales and zeros.
+	G is K // groupsize.
+	Set NO_GROUPS to groupsize == K, in which case G = 1 and the kernel is more efficient.
 
 	WARNING: This kernel assumes that K is a multiple of BLOCK_SIZE_K.
 	WARNING: This kernel assumes that N is a multiple of BLOCK_SIZE_N.
+	WARNING: This kernel assumes that groupsize is a multiple of BLOCK_SIZE_K.
 	"""
 	pid = tl.program_id(axis=0)
 	num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -166,27 +169,23 @@ def matmul4_kernel(
 	a_mask = (offs_am[:, None] < M)
 	# b_ptrs is set up such that it repeats elements along the K axis 8 times
 	b_ptrs = b_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-	scales_ptrs = scales_ptr + offs_bn * stride_scales
+	scales_ptrs = scales_ptr + offs_bn * stride_scales_n   # (BLOCK_SIZE_N,)
 	# zeros_ptrs is set up such that it repeats elements along the N axis 8 times
-	zeros_ptrs = zeros_ptr + (offs_bn // 8) * stride_zeros
+	zeros_ptrs = zeros_ptr + ((offs_bn // 8) * stride_zeros_n)   # (BLOCK_SIZE_N,)
 
 	# shifter is used to extract the 4 bits of each element in the 32-bit word from B and zeros
 	shifter = (offs_k % 8) * 4
 	zeros_shifter = (offs_bn % 8) * 4
 
-	# Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
-	scales = tl.load(scales_ptrs)  # (BLOCK_SIZE_N,)
-	zeros = tl.load(zeros_ptrs)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
+	# If G == 1, scales and zeros are the same for all K, so we can load them once
+	if NO_GROUPS:
+		# Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
+		scales = tl.load(scales_ptrs)  # (BLOCK_SIZE_N,)
+		zeros = tl.load(zeros_ptrs)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
 
-	# Unpack zeros
-	zeros = (zeros >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
-	zeros = (zeros + 1) * scales  # (BLOCK_SIZE_N,) float16
-
-	# For debugging
-	#offs_dk = 0 + tl.arange(0, BLOCK_SIZE_K)
-	#offs_dn = 0 + tl.arange(0, BLOCK_SIZE_N)
-	#debug_ptrs = debug_ptr + stride_dk * offs_dk[:, None] + stride_dn * offs_dn[None, :]
-	#tl.store(debug_ptrs, b)
+		# Unpack zeros
+		zeros = (zeros >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
+		zeros = (zeros + 1) * scales  # (BLOCK_SIZE_N,) float16
 
 	# Now calculate a block of output of shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
 	# M is along the batch dimension, N is along the outfeatures dimension, K is along the infeatures dimension
@@ -197,15 +196,24 @@ def matmul4_kernel(
 		a = tl.load(a_ptrs, mask=a_mask, other=0.)   # (BLOCK_SIZE_M, BLOCK_SIZE_K)
 		b = tl.load(b_ptrs)   # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
 
+		if not NO_GROUPS:
+			g_id = k // (groupsize // BLOCK_SIZE_K)
+			ptr = scales_ptrs + g_id * stride_scales_g
+			scales = tl.load(ptr)  # (BLOCK_SIZE_N,)
+			ptr = zeros_ptrs + g_id * stride_zeros_g   # (BLOCK_SIZE_N,)
+			zeros = tl.load(ptr)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
+
+			# Unpack zeros
+			zeros = (zeros >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
+			zeros = (zeros + 1) * scales  # (BLOCK_SIZE_N,) float16
+
 		# Now we need to unpack b (which is 4-bit values) into 32-bit values
 		b = (b >> shifter[:, None]) & 0xF  # Extract the 4-bit values
 		b = b * scales[None, :] - zeros[None, :]  # Scale and shift
-		#tl.store(debug_ptrs, b)
 
 		accumulator += tl.dot(a, b)
 		a_ptrs += BLOCK_SIZE_K * stride_ak
 		b_ptrs += (BLOCK_SIZE_K // 8) * stride_bk
-		#debug_ptrs += BLOCK_SIZE_K * stride_dk
 	
 	c = accumulator.to(tl.float16)
 	
@@ -217,16 +225,19 @@ def matmul4_kernel(
 	tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def triton_matmul4(a: torch.FloatTensor, qweight: torch.IntTensor, scales: torch.FloatTensor, qzeros: torch.IntTensor, bias: Optional[torch.FloatTensor] = None) -> torch.FloatTensor:
+def triton_matmul4(groupsize: int, a: torch.FloatTensor, qweight: torch.IntTensor, scales: torch.FloatTensor, qzeros: torch.IntTensor, bias: Optional[torch.FloatTensor] = None) -> torch.FloatTensor:
 	"""
 	Compute the matrix multiplication C = A x B + bias.
 	Where B is quantized using GPTQ and groupsize = -1 into 4-bit values.
 
 	A is of shape (..., K) float16
 	qweight is of shape (K//8, N) int32
-	scales is of shape (1, N) float16
-	qzeros is of shape (1, N//8) int32
+	scales is of shape (G, N) float16
+	qzeros is of shape (G, N//8) int32
 	bias is of shape (1, N) float16
+
+	groupsize is the number of infeatures in each group.
+	G = K // groupsize
 
 	Returns C of shape (..., N) float16
 	"""
@@ -240,25 +251,26 @@ def triton_matmul4(a: torch.FloatTensor, qweight: torch.IntTensor, scales: torch
 	N = qweight.shape[1]
 	# This is based on the possible BLOCK_SIZE_Ks
 	assert K % 16 == 0 and K % 32 == 0 and K % 64 == 0 and K % 128 == 0, "K must be a multiple of 16, 32, 64, and 128"
-	# This is based on the maximum BLOCK_SIZE_N
+	# This is based on the possible BLOCK_SIZE_Ns
 	assert N % 16 == 0 and N % 32 == 0 and N % 64 == 0 and N % 128 == 0 and N % 256 == 0, "N must be a multiple of 16, 32, 64, 128, and 256"
+	# This is based on the possible BLOCK_SIZE_Ks
+	assert groupsize % 32 == 0 and groupsize % 64 == 0 and groupsize % 128 == 0, "groupsize must be a multiple of 32, 64, and 128"
 
 	c = torch.empty((M, N), device='cuda', dtype=torch.float16)
-	#debug = torch.empty((32*32, 128), device='cuda', dtype=torch.float32)
 
 	grid = lambda META: (
 		triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
 	)
-	#grid = lambda META: (1,)  # For debugging
 	matmul4_kernel[grid](
-		x, qweight, c, #debug,
+		x, qweight, c,
 		scales, qzeros,
 		M, N, K,
 		x.stride(0), x.stride(1),
 		qweight.stride(0), qweight.stride(1),
 		c.stride(0), c.stride(1),
-		scales.stride(1), qzeros.stride(1),
-		#debug.stride(0), debug.stride(1),
+		scales.stride(0), scales.stride(1),
+		qzeros.stride(0), qzeros.stride(1),
+		groupsize, groupsize == K,
 	)
 
 	# Reshape c
@@ -269,4 +281,3 @@ def triton_matmul4(a: torch.FloatTensor, qweight: torch.IntTensor, scales: torch
 		c = c + bias
 	
 	return c
-	#return debug

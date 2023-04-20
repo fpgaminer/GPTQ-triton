@@ -13,14 +13,14 @@ from .fused_mlp import QuantLlamaMLP, make_fused_mlp
 from .quant_linear import QuantLinear, make_quant, triton_matmul4
 
 
-def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[str] = 'cuda', fuse_mlp: bool = True):
+def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[str] = 'cuda', fuse_mlp: Optional[bool] = None):
 	"""
 	Load a quantized model from a checkpoint.
 	Args:
 		checkpoint: Path to the checkpoint directory.
 		warmup_autotune: If True, run a warmup autotune pass. Otherwise autotune will run during forward passes.
 		device: Device to run the model on; needed if warmup_autotune is True.
-		fuse_mlp: If True, replace the MLP layers with fused versions.
+		fuse_mlp: If True, replace the MLP layers with fused versions.  If None, will apply fuse_mlp if the model's groupsize is -1, otherwise fuse_mlp will be disabled (it's slower when using grouping).
 	Returns:
 		The loaded model.
 	"""
@@ -73,7 +73,7 @@ def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[s
 	
 	make_quant_attn(model)
 
-	if fuse_mlp:
+	if fuse_mlp == True or (fuse_mlp is None and groupsize == -1):
 		make_fused_mlp(model)
 	
 	# Move the model to the correct device

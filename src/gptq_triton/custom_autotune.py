@@ -4,26 +4,27 @@ Mostly the same as the autotuner in Triton, but with a few changes like using 40
 import builtins
 import math
 import time
-from typing import Dict
+from typing import Dict, List, Optional
 
 import triton
 
 
 class Autotuner(triton.KernelInterface):
-	def __init__(self, fn, arg_names, configs, key, reset_to_zero, prune_configs_by: Dict = None, nearest_power_of_two: bool = False):
+	def __init__(self, fn, arg_names, configs, key, reset_to_zero, prune_configs_by: Dict = None, nearest_power_of_two: Optional[List[str]] = None):
 		'''
 		:param prune_configs_by: a dict of functions that are used to prune configs, fields:
 			'perf_model': performance model used to predicate running time with different configs, returns running time
 			'top_k': number of configs to bench
 			'prune_num_stages_by'(optional): a function used to prune num_stages. It take configs:List[Config] as its input, and returns pruned configs.
-			'nearest_power_of_two'(optional): whether to round key arguments to the nearest power of two when caching tuning results
+			'nearest_power_of_two'(optional): whether to round key arguments to the nearest power of two when caching tuning results, and which ones
 		'''
 		if not configs:
 			self.configs = [triton.Config({}, num_warps=4, num_stages=2)]
 		else:
 			self.configs = configs
 		self.key_idx = [arg_names.index(k) for k in key]
-		self.nearest_power_of_two = nearest_power_of_two
+		self.nearest_power_of_two = set(nearest_power_of_two) if nearest_power_of_two is not None else set()
+		self.nearest_power_of_two = [i for i in range(len(self.key_idx)) if key[i] in self.nearest_power_of_two]
 		self.cache = {}
 		# hook to reset all required tensor to zeros before relaunching a kernel
 		self.hook = lambda args: 0
@@ -75,12 +76,13 @@ class Autotuner(triton.KernelInterface):
 	def run(self, *args, **kwargs):
 		self.nargs = dict(zip(self.arg_names, args))
 		if len(self.configs) > 1:
-			key = tuple(args[i] for i in self.key_idx)
+			key = list(args[i] for i in self.key_idx)
 
 			# This reduces the amount of autotuning by rounding the keys to the nearest power of two
 			# In my testing this gives decent results, and greatly reduces the amount of tuning required
-			if self.nearest_power_of_two:
-				key = tuple([2 ** int(math.log2(x) + 0.5) for x in key])
+			for i in self.nearest_power_of_two:
+				key[i] = 2 ** int(math.log2(key[i]) + 0.5)
+			key = tuple(key)
 			
 			if key not in self.cache:
 				# prune configs

@@ -23,7 +23,7 @@ def make_quant_attn(model):
 		qzeros = torch.cat([q_proj.qzeros, k_proj.qzeros, v_proj.qzeros], dim=1)
 		scales = torch.cat([q_proj.scales, k_proj.scales, v_proj.scales], dim=1)
 
-		qkv_layer = QuantLinear(4, -1, q_proj.infeatures, q_proj.outfeatures + k_proj.outfeatures + v_proj.outfeatures, bias=False)
+		qkv_layer = QuantLinear(q_proj.bits, q_proj.groupsize, q_proj.infeatures, q_proj.outfeatures + k_proj.outfeatures + v_proj.outfeatures, bias=False)
 		qkv_layer.qweight = qweights
 		qkv_layer.qzeros = qzeros
 		qkv_layer.scales = scales

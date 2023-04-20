@@ -37,13 +37,14 @@ def autotune_warmup(model):
 		'up_proj_qweight': m.up_proj_qweight,
 		'up_proj_scales': m.up_proj_scales,
 		'up_proj_qzeros': m.up_proj_qzeros,
+		'groupsize': m.groupsize,
 	} for m in modules}
 
 	print(f'FusedMLP Warmup: Found {len(k_values)} unique K values.')
 
-	def func(m, k, gate_proj_qweight, gate_proj_scales, gate_proj_qzeros, up_proj_qweight, up_proj_scales, up_proj_qzeros):
+	def func(m, k, gate_proj_qweight, gate_proj_scales, gate_proj_qzeros, up_proj_qweight, up_proj_scales, up_proj_qzeros, groupsize):
 		a = torch.randn(1, m, k, dtype=torch.float16, device='cuda')
-		triton_llama_mlp_4(a, gate_proj_qweight, gate_proj_scales, gate_proj_qzeros, up_proj_qweight, up_proj_scales, up_proj_qzeros)
+		triton_llama_mlp_4(groupsize, a, gate_proj_qweight, gate_proj_scales, gate_proj_qzeros, up_proj_qweight, up_proj_scales, up_proj_qzeros)
 	
 	return (functools.partial(func, k=k, **v) for k, v in k_values.items())
 
@@ -56,6 +57,9 @@ class QuantLlamaMLP(nn.Module):
 		up_proj,
 	):
 		super().__init__()
+
+		assert gate_proj.groupsize == up_proj.groupsize
+
 		# Only save the quantized weights, not the QuantLinear modules
 		# This prevents the QuantLinear autotuning warmup from considering these modules
 		self.register_buffer('gate_proj_qweight', gate_proj.qweight)
@@ -64,6 +68,7 @@ class QuantLlamaMLP(nn.Module):
 		self.register_buffer('up_proj_qweight', up_proj.qweight)
 		self.register_buffer('up_proj_scales', up_proj.scales)
 		self.register_buffer('up_proj_qzeros', up_proj.qzeros)
+		self.groupsize = gate_proj.groupsize
 
 		self.infeatures = gate_proj.infeatures
 		self.outfeatures = down_proj.outfeatures
@@ -71,7 +76,7 @@ class QuantLlamaMLP(nn.Module):
 		self.down_proj = down_proj
 
 	def forward(self, x):
-		return self.down_proj(triton_llama_mlp_4(x, self.gate_proj_qweight, self.gate_proj_scales, self.gate_proj_qzeros, self.up_proj_qweight, self.up_proj_scales, self.up_proj_qzeros))
+		return self.down_proj(triton_llama_mlp_4(self.groupsize, x, self.gate_proj_qweight, self.gate_proj_scales, self.gate_proj_qzeros, self.up_proj_qweight, self.up_proj_scales, self.up_proj_qzeros))
 
 
 # This Triton kernel fuses the gate_proj, up_proj, activation, and multiplication of LlamaMLP
@@ -88,9 +93,13 @@ class QuantLlamaMLP(nn.Module):
 
 		triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),   # 3090
 		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 16, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),   # 3090
+		triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),    # 3090
+
+		# This configuration provides a benefit to groupsize=128, but groupsize isn't recommended for fused mlp right now
+		#triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),    # 3090
 	],
-	key=['M', 'N', 'K'],
-	nearest_power_of_two=True,
+	key=['M', 'N', 'K', 'NO_GROUPS'],
+	nearest_power_of_two=['M', 'N', 'K'],
 	prune_configs_by={
 		'early_config_prune': matmul4_kernel_config_pruner,
 		'perf_model': None,
@@ -106,7 +115,9 @@ def llama_mlp_fused_4_kernel(
 	stride_am, stride_ak,
 	stride_bk, stride_bn,
 	stride_cm, stride_cn,
-	stride_scales, stride_zeros,
+	stride_scales_g, stride_scales_n,
+	stride_zeros_g, stride_zeros_n,
+	groupsize, NO_GROUPS: tl.constexpr,
 	BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
 	GROUP_SIZE_M: tl.constexpr,
 ):
@@ -115,11 +126,15 @@ def llama_mlp_fused_4_kernel(
 	A is of shape (M, K) float16
 	B is of shape (K//8, N) int32
 	C is of shape (M, N) float16
-	scales is of shape (1, N) float16
-	zeros is of shape (1, N//8) int32
+	scales is of shape (G, N) float16
+	zeros is of shape (G, N//8) int32
+	groupsize is an int specifying the size of groups for scales and zeros.
+	G is K // groupsize.
+	Set NO_GROUPS to groupsize == K, in which case G = 1 and the kernel is more efficient.
 
 	WARNING: This kernel assumes that K is a multiple of BLOCK_SIZE_K.
 	WARNING: This kernel assumes that N is a multiple of BLOCK_SIZE_N.
+	WARNING: This kernel assumes that groupsize is a multiple of BLOCK_SIZE_K.
 	"""
 	pid = tl.program_id(axis=0)
 	num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -140,27 +155,29 @@ def llama_mlp_fused_4_kernel(
 	# b_ptrs is set up such that it repeats elements along the K axis 8 times
 	b1_ptrs = b1_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 	b2_ptrs = b2_ptr + ((offs_k[:, None] // 8) * stride_bk + offs_bn[None, :] * stride_bn)   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
-	scales1_ptrs = scales1_ptr + offs_bn * stride_scales
-	scales2_ptrs = scales2_ptr + offs_bn * stride_scales
+	scales1_ptrs = scales1_ptr + offs_bn * stride_scales_n  # (BLOCK_SIZE_N,)
+	scales2_ptrs = scales2_ptr + offs_bn * stride_scales_n  # (BLOCK_SIZE_N,)
 	# zeros_ptrs is set up such that it repeats elements along the N axis 8 times
-	zeros1_ptrs = zeros1_ptr + (offs_bn // 8) * stride_zeros
-	zeros2_ptrs = zeros2_ptr + (offs_bn // 8) * stride_zeros
+	zeros1_ptrs = zeros1_ptr + (offs_bn // 8) * stride_zeros_n  # (BLOCK_SIZE_N,)
+	zeros2_ptrs = zeros2_ptr + (offs_bn // 8) * stride_zeros_n  # (BLOCK_SIZE_N,)
 
 	# shifter is used to extract the 4 bits of each element in the 32-bit word from B and zeros
 	shifter = (offs_k % 8) * 4
 	zeros_shifter = (offs_bn % 8) * 4
 
-	# Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
-	scales1 = tl.load(scales1_ptrs)  # (BLOCK_SIZE_N,)
-	scales2 = tl.load(scales2_ptrs)  # (BLOCK_SIZE_N,)
-	zeros1 = tl.load(zeros1_ptrs)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
-	zeros2 = tl.load(zeros2_ptrs)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
+	# If G == 1, scales and zeros are the same for all K, so we can load them once
+	if NO_GROUPS:
+		# Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
+		scales1 = tl.load(scales1_ptrs)  # (BLOCK_SIZE_N,)
+		scales2 = tl.load(scales2_ptrs)  # (BLOCK_SIZE_N,)
+		zeros1 = tl.load(zeros1_ptrs)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
+		zeros2 = tl.load(zeros2_ptrs)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
 
-	# Unpack zeros
-	zeros1 = (zeros1 >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
-	zeros1 = (zeros1 + 1) * scales1  # (BLOCK_SIZE_N,) float16
-	zeros2 = (zeros2 >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
-	zeros2 = (zeros2 + 1) * scales2  # (BLOCK_SIZE_N,) float16
+		# Unpack zeros
+		zeros1 = (zeros1 >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
+		zeros1 = (zeros1 + 1) * scales1  # (BLOCK_SIZE_N,) float16
+		zeros2 = (zeros2 >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
+		zeros2 = (zeros2 + 1) * scales2  # (BLOCK_SIZE_N,) float16
 
 	# Now calculate a block of output of shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
 	# M is along the batch dimension, N is along the outfeatures dimension, K is along the infeatures dimension
@@ -170,19 +187,32 @@ def llama_mlp_fused_4_kernel(
 	accumulator2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 	for k in range(0, num_pid_k):
 		a = tl.load(a_ptrs, mask=a_mask, other=0.)   # (BLOCK_SIZE_M, BLOCK_SIZE_K)
-		b1 = tl.load(b1_ptrs)   # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
+		b = tl.load(b1_ptrs)   # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
+
+		if not NO_GROUPS:
+			g_id = k // (groupsize // BLOCK_SIZE_K)
+			scales1 = tl.load(scales1_ptrs + g_id * stride_scales_g)  # (BLOCK_SIZE_N,)
+			scales2 = tl.load(scales2_ptrs + g_id * stride_scales_g)  # (BLOCK_SIZE_N,)
+			zeros1 = tl.load(zeros1_ptrs + g_id * stride_zeros_g)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
+			zeros2 = tl.load(zeros2_ptrs + g_id * stride_zeros_g)  # (BLOCK_SIZE_N,), each element is repeated 8 times, int32
+
+			# Unpack zeros
+			zeros1 = (zeros1 >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
+			zeros2 = (zeros2 >> zeros_shifter) & 0xF  # (BLOCK_SIZE_N,) int32
+			zeros1 = (zeros1 + 1) * scales1  # (BLOCK_SIZE_N,) float16
+			zeros2 = (zeros2 + 1) * scales2  # (BLOCK_SIZE_N,) float16
 
 		# Now we need to unpack b (which is 4-bit values) into 32-bit values
-		b1 = (b1 >> shifter[:, None]) & 0xF  # Extract the 4-bit values
-		b1 = b1 * scales1[None, :] - zeros1[None, :]  # Scale and shift
+		b = (b >> shifter[:, None]) & 0xF  # Extract the 4-bit values
+		b = b * scales1[None, :] - zeros1[None, :]  # Scale and shift
 
-		accumulator1 += tl.dot(a, b1)
+		accumulator1 += tl.dot(a, b)
 
-		b2 = tl.load(b2_ptrs)   # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
-		b2 = (b2 >> shifter[:, None]) & 0xF  # Extract the 4-bit values
-		b2 = b2 * scales2[None, :] - zeros2[None, :]  # Scale and shift
+		b = tl.load(b2_ptrs)   # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
+		b = (b >> shifter[:, None]) & 0xF  # Extract the 4-bit values
+		b = b * scales2[None, :] - zeros2[None, :]  # Scale and shift
 
-		accumulator2 += tl.dot(a, b2)
+		accumulator2 += tl.dot(a, b)
 
 		a_ptrs += BLOCK_SIZE_K * stride_ak
 		b1_ptrs += (BLOCK_SIZE_K // 8) * stride_bk
@@ -209,6 +239,7 @@ def silu(x):
 
 
 def triton_llama_mlp_4(
+	groupsize: int,
 	a: torch.FloatTensor,
 	gate_qweight: torch.IntTensor,
 	gate_scales: torch.FloatTensor,
@@ -223,8 +254,11 @@ def triton_llama_mlp_4(
 
 	A is of shape (..., K) float16
 	*_qweight is of shape (K//8, N) int32
-	*_scales is of shape (1, N) float16
-	*_qzeros is of shape (1, N//8) int32
+	*_scales is of shape (G, N) float16
+	*_qzeros is of shape (G, N//8) int32
+
+	groupsize is the number of infeatures in each group.
+	G = K // groupsize
 
 	Returns C of shape (..., N) float16
 	"""
@@ -239,8 +273,10 @@ def triton_llama_mlp_4(
 	N = gate_qweight.shape[1]
 	# This is based on the possible BLOCK_SIZE_Ks
 	assert K % 16 == 0 and K % 32 == 0 and K % 64 == 0 and K % 128 == 0, "K must be a multiple of 16, 32, 64, and 128"
-	# This is based on the maximum BLOCK_SIZE_N
+	# This is based on the possible BLOCK_SIZE_Ns
 	assert N % 16 == 0 and N % 32 == 0 and N % 64 == 0 and N % 128 == 0 and N % 256 == 0, "N must be a multiple of 16, 32, 64, 128, and 256"
+	# This is based on the possible BLOCK_SIZE_Ks
+	assert groupsize % 32 == 0 and groupsize % 64 == 0 and groupsize % 128 == 0, "groupsize must be a multiple of 32, 64, and 128"
 
 	c = torch.empty((M, N), device='cuda', dtype=torch.float16)
 
@@ -255,7 +291,9 @@ def triton_llama_mlp_4(
 		x.stride(0), x.stride(1),
 		gate_qweight.stride(0), gate_qweight.stride(1),
 		c.stride(0), c.stride(1),
-		gate_scales.stride(1), gate_qzeros.stride(1),
+		gate_scales.stride(0), gate_scales.stride(1),
+		gate_qzeros.stride(0), gate_qzeros.stride(1),
+		groupsize, groupsize == K,
 	)
 
 	# Reshape c

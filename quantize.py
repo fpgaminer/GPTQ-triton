@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from datautils import get_dataset
 from gptq import GPTQ, Quantizer
+import gptq
 from gptq_triton import QuantLinear, quant_linear
 from tqdm import tqdm
 from transformers import AutoTokenizer, LlamaForCausalLM
@@ -36,6 +37,9 @@ parser.add_argument('--true-sequential', action='store_true', help='Whether to r
 def main():
 	args = parser.parse_args()
 	args.save = Path(args.save)
+
+	if args.act_order and args.groupsize != -1:
+		raise ValueError('Cannot use act_order and groupsize together')
 
 	print('Loading model...')
 	model = get_llama(args.model)
@@ -247,7 +251,10 @@ def pack_linear(quant, weights: torch.FloatTensor, scales: torch.FloatTensor, ze
 	intweight = []
 	for idx in range(quant.infeatures):
 		g_idx = idx // quant.groupsize
-		intweight.append(torch.round((weights[:,idx] + scale_zeros[g_idx]) / scales[g_idx]).to(torch.int32)[:,None])
+		# TODO: This is oddly complex.  The `gptq.quantize` function does `return scale * (q - zero)`, so shouldn't
+		# this just be `q = torch.round((weights[:,idx] / scales[g_idx]) + zero[g_idx])`?
+		q = torch.round((weights[:,idx] + scale_zeros[g_idx]) / scales[g_idx]).to(torch.int32)
+		intweight.append(q[:,None])
 	intweight = torch.cat(intweight,dim=1)
 	intweight = intweight.t().contiguous()
 
@@ -266,7 +273,7 @@ def pack_linear(quant, weights: torch.FloatTensor, scales: torch.FloatTensor, ze
 			raise NotImplementedError("Only 2,4,8 bits are supported.")
 	
 	# Subtract 1 from the zero point
-	zeros -= 1
+	zeros = zeros - 1
 
 	# Pack the zero points into uint32's
 	zeros = zeros.to(torch.int32)
@@ -282,6 +289,44 @@ def pack_linear(quant, weights: torch.FloatTensor, scales: torch.FloatTensor, ze
 			col += 1
 		else:
 			raise NotImplementedError("Only 2,4,8 bits are supported.")
+
+
+@torch.no_grad()
+def dumbquant(layer, bits: int, groupsize: int = -1, perchannel: bool = True, sym: bool = False, mse: bool = False):
+	"""
+	Used to generate test data by performing a dumb quantization on the weights of a layer.
+	Layer is modified in place.
+	"""
+	assert isinstance(layer, nn.Linear)
+	quantizer = Quantizer()
+	quantizer.configure(bits, perchannel=perchannel, sym=sym, mse=mse)
+
+	W = layer.weight.data.clone()
+	W = W.float()
+
+	quantizer.find_params(W, weight=True)  # TODO: Is this needed?
+
+	groupsize = W.shape[1] if groupsize == -1 else groupsize
+	scale = []
+	zero = []
+
+	for i in range(0, W.shape[1]):
+		w = W[:, i]
+
+		if i % groupsize == 0:
+			quantizer.find_params(W[:, (i):(i + groupsize)], weight=True)
+			scale.append(quantizer.scale)
+			zero.append(quantizer.zero)
+
+		q = gptq.quantize(
+			w.unsqueeze(1), quantizer.scale, quantizer.zero, quantizer.maxq
+		).flatten()
+		layer.weight.data[:, i] = q.to(layer.weight.data.dtype)
+
+	scale = torch.cat(scale, dim=1)
+	zero = torch.cat(zero, dim=1)
+
+	return scale, zero
 			
 
 if __name__ == '__main__':

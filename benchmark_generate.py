@@ -41,7 +41,7 @@ def main():
 		model.eval()
 		model.to('cuda')
 	
-	tokenizer = AutoTokenizer.from_pretrained(args.model)
+	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
 	prompt_lengths = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 	max_lengths = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
