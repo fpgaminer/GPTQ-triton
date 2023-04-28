@@ -33,7 +33,7 @@ def main():
 		model.eval()
 		model.to('cuda')
 	
-	tokenizer = AutoTokenizer.from_pretrained(args.model)
+	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
 	encoded_prompt = tokenizer.encode(args.prompt, add_special_tokens=False, return_tensors='pt').to('cuda')
 
@@ -57,7 +57,7 @@ def main():
 	
 	for generated_sequence in output_sequences:
 		generated_sequence = generated_sequence.tolist()
-		total_tokens_generated += len(generated_sequence)
+		total_tokens_generated += len(generated_sequence) - len(encoded_prompt[0])
 
 		text = tokenizer.decode(generated_sequence, clean_up_tokenization_spaces=True)
 

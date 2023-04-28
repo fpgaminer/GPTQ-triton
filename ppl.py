@@ -98,7 +98,7 @@ def calculate_perplexity(model, tokenizer, dataset: str, max_length: int, stride
 		with torch.no_grad():
 			# Ask the model for logits
 			# NOTE: Instead of calling HF's model wrapper, we call the model directly to hopefully cut down on some memory overhead
-			outputs = model.model(input_ids[:, :-1])
+			outputs = model.model(input_ids[:, :-1], use_cache=False)
 			logits = model.lm_head(outputs[0][..., -trg_len:, :])
 
 			# The last trg_len tokens are the labels

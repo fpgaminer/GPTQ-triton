@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.3] - 2023-04-28
+
+- Disabled cache in `ppl.py`; isn't used and saves memory.
+- Added more benchmarks to README.
+- Fixed bug in `generate.py`; generated sequence length was not calculated correctly.
+
+
 ## [0.0.3] - 2023-04-19
 
 - Added support for groupsize.
