@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.0.4] - 2023-04-29
+
+- Fixed an interaction between the fused QKV projection and the key-value cache that caused excessive memory usage.
+
+
 ## [0.0.3] - 2023-04-28
 
 - Disabled cache in `ppl.py`; isn't used and saves memory.
