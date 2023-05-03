@@ -86,7 +86,7 @@ Arguments:
 * `--act-order`: Use activation order quantization.
 * `--true-sequential`: Use true sequential quantization.
 
-**NOTE:** The Triton kernel is currently only implemented for 4-bits and groupsize -1.
+**NOTE:** The Triton kernel is currently only implemented for 4-bits.
 
 ### Explanation of `groupsize`
 
