@@ -27,7 +27,7 @@ def make_fused_mlp(m, parent_name=''):
 	return m
 
 
-def autotune_warmup(model):
+def autotune_warmup(model, device="cuda"):
 	# Find all the QuantLlamaMLP layers
 	modules = (m for m in model.modules() if isinstance(m, QuantLlamaMLP))
 	k_values = {m.infeatures: {
@@ -43,7 +43,7 @@ def autotune_warmup(model):
 	print(f'FusedMLP Warmup: Found {len(k_values)} unique K values.')
 
 	def func(m, k, gate_proj_qweight, gate_proj_scales, gate_proj_qzeros, up_proj_qweight, up_proj_scales, up_proj_qzeros, groupsize):
-		a = torch.randn(1, m, k, dtype=torch.float16, device='cuda')
+		a = torch.randn(1, m, k, dtype=torch.float16, device=device)
 		triton_llama_mlp_4(groupsize, a, gate_proj_qweight, gate_proj_scales, gate_proj_qzeros, up_proj_qweight, up_proj_scales, up_proj_qzeros)
 	
 	return (functools.partial(func, k=k, **v) for k, v in k_values.items())

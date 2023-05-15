@@ -85,7 +85,7 @@ def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[s
 		if device is None:
 			raise ValueError("You must specify a device when warmup_autotune is True.")
 		
-		autotune_warmup(model)
+		autotune_warmup(model, device)
 	
 	model.seqlen = 2048
 	print('Done.')
@@ -93,7 +93,7 @@ def load_quant(checkpoint: str, warmup_autotune: bool = True, device: Optional[s
 	return model
 
 
-def autotune_warmup(model):
+def autotune_warmup(model, device="cuda"):
 	"""
 	The Triton kernels autotune themselves for specific input sizes.  But this takes time.
 	This function collects information on all possible input sizes for the different kernels
@@ -103,7 +103,7 @@ def autotune_warmup(model):
 	"""
 	from tqdm import tqdm
 
-	warmups = itertools.chain(quant_linear.autotune_warmup(model), fused_mlp.autotune_warmup(model))
+	warmups = itertools.chain(quant_linear.autotune_warmup(model, device=device), fused_mlp.autotune_warmup(model, device=device))
 	warmups = list(warmups)
 
 	print('Warming up autotune cache ...')

@@ -32,7 +32,7 @@ def make_quant(model, bits, groupsize):
 		setattr(parent, name[len(parent_name) + 1:], qlayer)
 
 
-def autotune_warmup(model):
+def autotune_warmup(model, device="cuda"):
 	# Find all the QuantLinear layers
 	modules = (m for m in model.modules() if isinstance(m, QuantLinear))
 	kn_values = {(m.infeatures, m.outfeatures): (m.qweight, m.scales, m.qzeros, m.groupsize) for m in modules}
@@ -40,7 +40,7 @@ def autotune_warmup(model):
 	print(f'QuantLinear Warmup: Found {len(kn_values)} unique KN values.')
 
 	def func(m, k, qweight, scales, qzeros, groupsize):
-		a = torch.randn(1, m, k, dtype=torch.float16, device='cuda')
+		a = torch.randn(1, m, k, dtype=torch.float16, device=device)
 		triton_matmul4(groupsize, a, qweight, scales, qzeros)
 	
 	return (functools.partial(func, k=k, qweight=qweight, scales=scales, qzeros=qzeros, groupsize=groupsize) for (k, n), (qweight, scales, qzeros, groupsize) in kn_values.items())
