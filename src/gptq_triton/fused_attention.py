@@ -8,6 +8,9 @@ from transformers.models.llama.modeling_llama import LlamaAttention, LlamaConfig
 import triton
 import triton.language as tl
 
+# triton 2.1.0[head] compat: remap .libdevice to .math
+if hasattr(tl, "math"):
+    tl.libdevice = tl.math
 
 @triton.jit
 def rotate_half_kernel(
@@ -44,7 +47,6 @@ def rotate_half_kernel(
     position_id = tl.load(position_ids_ptr + batch * position_ids_batch_stride + seq)
     # As sometimes happens, just calculating this on the fly is faster than loading it from memory.
     # Use `tl.libdevice.exp` rather than `tl.exp` -- the latter is less accurate.
-    # TODO triton 2.1.0 moved tl.libdevice.exp to tl.math.exp
     freq = tl.libdevice.exp((col + tl.arange(0, BLOCK_WIDTH)).to(tl.float32) * INV_BASE) * position_id
 
     cos = tl.cos(freq).to(tl.float32)
